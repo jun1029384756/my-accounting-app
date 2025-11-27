@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ==========================================
 # 1. 後端邏輯區
@@ -32,9 +32,12 @@ def init_db():
 
 def save_to_db(df):
     conn = sqlite3.connect(DB_NAME)
-    data = df[['日期', '商店名稱', '品項', '金額']].copy()
-    data.columns = ['date', 'store', 'item', 'price']
-    data['fixed_category'] = None 
+    # 確保有 fixed_category 欄位，如果沒有就補上 None
+    if 'fixed_category' not in df.columns:
+        df['fixed_category'] = None
+        
+    data = df[['日期', '商店名稱', '品項', '金額', 'fixed_category']].copy()
+    data.columns = ['date', 'store', 'item', 'price', 'fixed_category']
     data.to_sql('expenses', conn, if_exists='append', index=False)
     conn.close()
 
@@ -43,6 +46,13 @@ def update_transaction(row_id, new_item_name, new_price, new_category):
     c = conn.cursor()
     c.execute("UPDATE expenses SET item = ?, price = ?, fixed_category = ? WHERE id = ?", 
               (new_item_name, new_price, new_category, row_id))
+    conn.commit()
+    conn.close()
+
+def delete_transaction(row_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM expenses WHERE id = ?", (row_id,))
     conn.commit()
     conn.close()
 
@@ -152,6 +162,31 @@ def parse_messy_excel(df_raw):
                 temp_date, temp_price = None, None
     return pd.DataFrame(clean_data)
 
+# --- 🔥 新增：天天記帳 App 專用解析器 ---
+def parse_daily_accounting(df):
+    """處理天天記帳匯出的 CSV"""
+    # 1. 篩選只要「支出」
+    if '收支區分' in df.columns:
+        df = df[df['收支區分'] == '支'].copy()
+    
+    # 2. 處理日期 (20251126 -> 2025-11-26)
+    # 先轉字串，再轉日期格式
+    df['日期'] = pd.to_datetime(df['日期'].astype(str), format='%Y%m%d').dt.strftime('%Y-%m-%d')
+    
+    # 3. 處理品項 (使用備註，若無則用空白)
+    df['品項'] = df['備註'].fillna('')
+    # 如果備註是空的，就用類別名稱代替 (例如「飲食」)
+    df.loc[df['品項'] == '', '品項'] = df['類別']
+    
+    # 4. 處理商店名稱 (天天記帳通常沒有店名，給預設值)
+    df['商店名稱'] = '-' 
+    
+    # 5. 處理分類 (直接沿用 App 的分類到 fixed_category)
+    # 這裡可以做一個簡單的對照，或者直接信賴 App 的分類
+    df['fixed_category'] = df['類別'] # 這一招很強，直接把它的分類變成我們的「強制分類」
+    
+    return df[['日期', '商店名稱', '品項', '金額', 'fixed_category']]
+
 # ==========================================
 # 2. 前端介面區
 # ==========================================
@@ -161,7 +196,6 @@ st.set_page_config(page_title="My Asset | 智慧記帳", page_icon="💳", layou
 
 st.sidebar.title("功能控制台")
 
-# --- 匯入區 ---
 import_mode = st.sidebar.radio("匯入模式", ["✍️ 手動輸入", "📂 上傳 Excel/CSV"], label_visibility="collapsed")
 if 'preview_df' not in st.session_state: st.session_state.preview_df = None
 
@@ -177,23 +211,34 @@ if import_mode == "✍️ 手動輸入":
             st.rerun()
 
 elif import_mode == "📂 上傳 Excel/CSV":
+    st.sidebar.caption("支援：財政部 Excel/CSV、天天記帳 CSV")
     up_file = st.sidebar.file_uploader("選擇檔案", type=["csv", "xlsx"])
     if up_file:
         try:
+            # 1. 讀取檔案
             if up_file.name.endswith('.csv'):
                 try: df_raw = pd.read_csv(up_file)
                 except: 
                     up_file.seek(0)
-                    df_raw = pd.read_csv(up_file, encoding='big5')
+                    df_raw = pd.read_csv(up_file, encoding='big5') # 嘗試 Big5 讀取 (天天記帳有時候需要)
             else: df_raw = pd.read_excel(up_file)
             
-            if '商店名稱' not in df_raw.columns and '店名' not in df_raw.columns:
+            # 2. 判斷格式並轉換
+            if '收支區分' in df_raw.columns and '備註' in df_raw.columns:
+                st.sidebar.success("偵測到「天天記帳」格式！")
+                df_clean = parse_daily_accounting(df_raw)
+                
+            elif '商店名稱' not in df_raw.columns and '店名' not in df_raw.columns:
+                st.sidebar.info("偵測到財政部複製貼上格式...")
                 df_clean = parse_messy_excel(df_raw)
             else:
+                st.sidebar.info("偵測到標準格式...")
                 df_clean = df_raw.rename(columns={'消費日期':'日期', '店名':'商店名稱', '總金額':'金額'})
                 if '品項' not in df_clean: df_clean['品項'] = '一般消費'
+                
             if not df_clean.empty: st.session_state.preview_df = df_clean
-        except: st.sidebar.error("解析失敗")
+            
+        except Exception as e: st.sidebar.error(f"解析失敗：{e}")
 
 if st.session_state.preview_df is not None:
     st.sidebar.success(f"成功辨識 {len(st.session_state.preview_df)} 筆！")
@@ -222,12 +267,20 @@ if not df_all.empty:
 else:
     df_display = pd.DataFrame()
 
+# --- 危險區域 ---
+with st.sidebar.expander("🗑️ 危險區域 (清空資料)"):
+    st.warning("注意：這會刪除所有帳務紀錄！")
+    if st.button("確認清空所有資料"):
+        clear_db()
+        st.success("資料庫已清空")
+        st.rerun()
+
 # ==========================================
 # 主畫面
 # ==========================================
 st.title("💳 My Asset 智慧記帳")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 月度分析 (Trends)", "📂 帳務明細 (搜尋/編輯)", "⚙️ 規則管理", "✂️ 拆帳"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 月度分析 (Trends)", "📂 帳務明細 (刪除/編輯)", "⚙️ 規則管理", "✂️ 拆帳"])
 
 if not df_all.empty:
     rules = load_custom_rules()
@@ -235,17 +288,13 @@ if not df_all.empty:
     df_display = df_all.loc[df_display.index].copy()
     uk_count = len(df_display[df_display['分類結果']=='其他'])
     
-    # --- Tab 1: 趨勢與分析 ---
     with tab1:
         st.subheader("📈 每月消費趨勢")
         trend_data = df_all.groupby('月份')['金額'].sum().reset_index()
         fig_trend = px.bar(trend_data, x='月份', y='金額', text='金額', color='月份')
         st.plotly_chart(fig_trend, use_container_width=True)
-        
         st.divider()
-        
         st.subheader(f"📊 {selected_month} 消費分析")
-        
         c1, c2, c3 = st.columns(3)
         c1.metric("總消費", f"${df_display['金額'].sum():,}")
         c2.metric("總筆數", f"{len(df_display)}")
@@ -257,7 +306,6 @@ if not df_all.empty:
         
         bar_data = df_display.groupby('分類結果')['金額'].sum().reset_index().sort_values('金額', ascending=True)
         fig_bar = px.bar(bar_data, x='金額', y='分類結果', orientation='h', text='金額', title="分類排行 (點擊查看明細)")
-        
         selected_event = col_r.plotly_chart(fig_bar, use_container_width=True, on_select="rerun", key="bar_select")
         
         if len(selected_event.selection.points) > 0:
@@ -268,48 +316,32 @@ if not df_all.empty:
             filtered_df = df_display[df_display['分類結果'] == cat].sort_values('日期', ascending=False)
             st.dataframe(filtered_df[['日期', '商店名稱', '顯示品項', '金額']], use_container_width=True, column_config={"顯示品項": "品項"})
 
-    # --- Tab 2: 明細表 (含搜尋與日期範圍) ---
     with tab2:
-        # 🔥 新增搜尋功能區
         col_search, col_date = st.columns([1, 1])
-        search_term = col_search.text_input("🔍 關鍵字搜尋 (店名/品項/金額)", placeholder="例如：全家、咖啡、100")
-        
-        # 預設日期範圍 (當月第一天 ~ 今天)
+        search_term = col_search.text_input("🔍 關鍵字搜尋", placeholder="例如：全家、咖啡、100")
         today = datetime.now()
         first_day = today.replace(day=1)
         date_range = col_date.date_input("📅 日期範圍篩選", value=(first_day, today))
         
-        # 處理搜尋邏輯
         df_editor = df_display[['id', '日期', '商店名稱', '顯示品項', '金額', '分類結果']].copy()
-        df_editor['日期'] = pd.to_datetime(df_editor['日期']) # 轉回 datetime 以便篩選
-        
-        # 1. 日期篩選
+        df_editor['日期'] = pd.to_datetime(df_editor['日期'])
         if len(date_range) == 2:
-            start_d, end_d = date_range
-            start_d = pd.Timestamp(start_d)
-            end_d = pd.Timestamp(end_d)
+            start_d, end_d = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
             df_editor = df_editor[(df_editor['日期'] >= start_d) & (df_editor['日期'] <= end_d)]
-        
-        # 2. 關鍵字篩選
         if search_term:
-            # 轉成字串來搜尋
-            df_editor = df_editor[
-                df_editor['商店名稱'].astype(str).str.contains(search_term, case=False) | 
-                df_editor['顯示品項'].astype(str).str.contains(search_term, case=False) |
-                df_editor['金額'].astype(str).str.contains(search_term)
-            ]
+            df_editor = df_editor[df_editor['商店名稱'].astype(str).str.contains(search_term, case=False) | df_editor['顯示品項'].astype(str).str.contains(search_term, case=False) | df_editor['金額'].astype(str).str.contains(search_term)]
         
-        # 準備顯示與編輯
         df_editor = df_editor.sort_values('日期', ascending=False)
         df_editor = df_editor.rename(columns={'顯示品項': '品項'})
-        df_editor['日期'] = df_editor['日期'].dt.strftime('%Y-%m-%d') # 顯示用字串
+        df_editor['日期'] = df_editor['日期'].dt.strftime('%Y-%m-%d')
+        df_editor.insert(0, "刪除", False)
 
         st.caption(f"共找到 {len(df_editor)} 筆資料")
-
         edited_df = st.data_editor(
             df_editor,
             column_config={
                 "id": None,
+                "刪除": st.column_config.CheckboxColumn(width="small"),
                 "日期": st.column_config.TextColumn(disabled=True),
                 "商店名稱": st.column_config.TextColumn(disabled=True),
                 "品項": st.column_config.TextColumn(disabled=False),
@@ -318,35 +350,34 @@ if not df_all.empty:
             },
             hide_index=True, use_container_width=True, key="detail_edit"
         )
-        if st.button("💾 儲存明細變更"):
+        if st.button("💾 儲存明細變更 (含刪除)"):
             changes_count = 0
+            deleted_count = 0
             for index, row in edited_df.iterrows():
+                if row['刪除'] == True:
+                    delete_transaction(row['id'])
+                    deleted_count += 1
+                    continue
                 original_row = df_all[df_all['id'] == row['id']].iloc[0]
-                if (row['分類結果'] != original_row['分類結果'] or 
-                    row['品項'] != original_row['顯示品項'] or 
-                    row['金額'] != original_row['金額']):
+                if (row['分類結果'] != original_row['分類結果'] or row['品項'] != original_row['顯示品項'] or row['金額'] != original_row['金額']):
                     update_transaction(row['id'], row['品項'], row['金額'], row['分類結果'])
                     changes_count += 1
-            if changes_count > 0: st.success("已更新！"); st.rerun()
+            if deleted_count > 0 or changes_count > 0: st.success(f"刪除 {deleted_count} 筆，更新 {changes_count} 筆！"); st.rerun()
             else: st.info("無變更")
 
-    # --- Tab 3: 規則管理 ---
     with tab3:
         if uk_count > 0:
             st.warning(f"👇 {selected_month} 有 {uk_count} 筆未分類！")
             unknown_df = df_display[df_display['分類結果']=='其他']
             suggestions = []
-            
             store_stats = unknown_df[unknown_df['商店名稱'] != '-'].groupby('商店名稱')['金額'].agg(['sum', 'count']).reset_index()
             for _, row in store_stats.iterrows():
                 suggestions.append({"關鍵字": row['商店名稱'], "類型": "商店", "參考金額": row['sum'], "筆數": row['count']})
-                
             ignored_items = ['一般消費', '-', '', 'nan']
             item_stats = unknown_df[~unknown_df['品項'].isin(ignored_items)].groupby('品項')['金額'].agg(['sum', 'count']).reset_index()
             for _, row in item_stats.iterrows():
                 if row['品項'] not in [s['關鍵字'] for s in suggestions]:
                     suggestions.append({"關鍵字": row['品項'], "類型": "品項", "參考金額": row['sum'], "筆數": row['count']})
-            
             if suggestions:
                 suggestion_df = pd.DataFrame(suggestions)
                 suggestion_df['請選擇分類'] = None
@@ -365,8 +396,7 @@ if not df_all.empty:
                 )
                 if st.button("💾 儲存規則"):
                     for index, row in edited_result.iterrows():
-                        if row['請選擇分類']:
-                            save_custom_rule(row['關鍵字'], row['請選擇分類'], row['預設品項(選填)'])
+                        if row['請選擇分類']: save_custom_rule(row['關鍵字'], row['請選擇分類'], row['預設品項(選填)'])
                     st.success("已更新！"); st.rerun()
 
         st.markdown("### ⚙️ 規則管理")
@@ -374,7 +404,6 @@ if not df_all.empty:
         rules_list = []
         for k, v in rules.items():
             rules_list.append({"刪除": False, "關鍵字": k, "分類": v['category'], "預設品項": v.get('item')})
-        
         edited_rules = st.data_editor(
             pd.DataFrame(rules_list),
             column_config={
@@ -393,23 +422,19 @@ if not df_all.empty:
             save_all_rules(new_dict)
             st.success("已更新！"); st.rerun()
 
-    # --- Tab 4: 拆帳 ---
     with tab4:
         st.subheader("✂️ 拆帳")
         recent_df = df_all.sort_values('日期', ascending=False).head(30)
         recent_df['label'] = recent_df.apply(lambda x: f"{x['id']} | {x['日期'].strftime('%Y-%m-%d')} | {x['商店名稱']} | ${x['金額']}", axis=1)
         selected_option = st.selectbox("選擇交易：", options=recent_df['label'])
-        
         if selected_option:
             selected_id = int(selected_option.split(" | ")[0])
             target_row = df_all[df_all['id'] == selected_id].iloc[0]
             total_amount = target_row['金額']
             st.write(f"### 總金額：${total_amount}")
-            
             if 'split_data' not in st.session_state or st.session_state.get('current_split_id') != selected_id:
                 st.session_state.current_split_id = selected_id
                 st.session_state.split_data = pd.DataFrame([{"品項": "", "金額": 0, "分類": "飲食"}, {"品項": "", "金額": 0, "分類": "日常用品"}])
-
             edited_split = st.data_editor(
                 st.session_state.split_data,
                 column_config={
@@ -419,13 +444,11 @@ if not df_all.empty:
                 },
                 num_rows="dynamic", use_container_width=True, key="split_editor"
             )
-            
             current_sum = edited_split['金額'].sum()
             remaining = total_amount - current_sum
             c1, c2 = st.columns(2)
             c1.metric("拆分總和", f"${current_sum}")
             c2.metric("剩餘", f"${remaining}", delta_color="normal" if remaining==0 else "inverse")
-            
             if remaining == 0:
                 if st.button("🚀 確認拆分"):
                     new_rows = []
